@@ -30,6 +30,25 @@ V0.31 incorporates the L1.B / L1.C output:
 - **§14** — Tests added for sponsor cap, score-0 fallback, effectiveWager invariants, RewardDistributor reserve/assign/finalize, encryptedPayload empty-check.
 - **§15** — T4.3 split into a/b/c/d/e (五段); L2-T5 split into Router (T5.1) + BuybackExecutor (T5.2). Operational details, see [docs/L1-PLAN.md](L1-PLAN.md).
 
+### Post-T0.B review revisions
+
+The L2-T0.B GPT-5.5 review surfaced a set of cross-reference, atomicity, and decision-resolution gaps. The patches below are applied internally to V0.31 (document revision unchanged; these are refinements within the same spec).
+
+- **§4.3** — Interaction flow synced with §10.x: `createBounty` (not createProposition); Pool 2 split written `30/30/20/10/10`; reward path written `reserveRewards → assignRewards → finalizeRewards → claimTokens` (not `distributeRewards`); explicit `closeBounty()` and `submitCutoffHint()` rows added.
+- **§5.2** — Numerical scoring: `score = WAD_SQUARED / max(rawError, MIN_BRIER)` is the canonical output; the residual "Lower rawError is better" prose removed for consistency with §5.3 / §11 Pass 1.
+- **§5.8** — Invalidation refund clarified to **`effectiveWager` refund** (D1-b ratification): the 1% submission fee committed to `Treasury.CAT_FEE` at submission is non-refundable; no Treasury fee clawback path. Sponsors still get 100% deposit refund.
+- **§6.4** — Event name aligned with §10.3: `KCoefficientObserved(month, kWad)` (was `KCoefficientUpdated`).
+- **§9** — `Prediction.inTopGroup` storage field removed (Opt-α design); top-group membership computed lazily in Pass 3/4. `K_WAD_PHASE5/6` written as compilable Solidity literals (`5e17` / `25e16`); the encoding caveat note is no longer needed.
+- **§10.1** — `SponsorCapReached` declared as a Solidity custom `error` (not an `event`); semantic was already "reverted on 101st new sponsor".
+- **§10.2** — Added `closeBounty(bountyId)` permissionless passthrough. `submitCutoffHint` natspec updated to permit overwriting a failed hint with counter-reset semantics (D2-b). `resolveAsInvalid` natspec clarifies fee non-refundability.
+- **§11** — Pass 2 rewritten: hint replaceable on verification failure; per-prediction `inTopGroup` writes removed; counters reset on overwrite. Pass 3 / Pass 4 derive top-group membership lazily as `score >= topGroupCutoffScore`. Added explicit "State initialization & mirroring" and "Events emitted during settlement" subsections (clarifies `SettlementProgressed` / `NoSignalSettled` / `SettlementComplete` emit timing). Pool 2 splits documented as per-call recompute (not persisted on `SettlementState`).
+- **§14** — Invalidation test updated to assert `effectiveWager` refund (not full raw refund) and `CAT_FEE` invariance. Cutoff hint replacement test added (D2-b + Opt-α). `closeBounty` passthrough test added. `SponsorCapReached` matcher updated to custom error.
+- **§15** — `T3.1` references `pullBuybackForEpoch()` (not `scheduleBuyback`); `T3.2` describes `reserve/assign/finalize/claim` lifecycle (not "monthly cap with auto-reduction"); `T6.1` references `DeployCore.s.sol` + `DeployBuyback.s.sol` (not `Deploy.s.sol`).
+
+**Two new ratified mini-decisions** (not part of the original L1.C five):
+- **D1-b** — invalidation refunds `effectiveWager` only; submission fee is non-refundable. Trade-off: marginal user perception ("99% refund") in exchange for zero new Treasury attack surface and zero new fee-clawback path.
+- **D2-b + Opt-α** — cutoff hint is replaceable on verification failure; top-group membership computed lazily, no `inTopGroup` storage. Trade-off: a few hundred extra gas per prediction in Pass 3/4 (lazy comparison) in exchange for failure recovery in O(minutes) instead of bounty-stuck-requiring-oracle-invalidation.
+
 ---
 
 ## 1. Design Philosophy & Positioning
@@ -142,22 +161,28 @@ TRANSFER_CONTROLLER_ROLE      → DEFAULT_ADMIN_ROLE (controls PsychohistoryToke
 ### 4.3 Interaction Flow
 
 ```
-Sponsor → BountyManager.createProposition()                      [initial sponsor deposit]
-Sponsor → BountyManager.addSponsorship()                         [bidding during open window]
-Predictor → PredictionEngine.submitPrediction()                  [wager in USDC]
-Oracle → PredictionEngine.resolve() OR resolveAsInvalid()
-Anyone → PredictionEngine.settle(startIndex, endIndex)           [paginated]
-  ├─ Computes scores, ranks, top-50% cutoff
-  ├─ Distributes Pool 1 (predictor wager pool)
-  ├─ Distributes Pool 2 (sponsor pool) in 4 slices: 30/30/20/20
-  ├─ Sends 20% of Pool 2 to Treasury (buyback allocation)
-  ├─ Sends 10% of Pool 2 to team wallet, 10% to DAO fund (via Treasury)
-  ├─ Calls RewardDistributor.distributeRewards() for Pool 3 ($PSYH)
-  └─ Sets each predictor's claimable payout and token reward
-Winner → PredictionEngine.claim()                                [pull USDC payout]
-Winner → RewardDistributor.claimTokens()                         [pull $PSYH]
-Sponsor → BountyManager.claimSponsorshipRefund()                 [only if Invalidated or no predictors]
+Sponsor   → BountyManager.createBounty()                         [initial sponsor deposit]
+Sponsor   → BountyManager.addSponsorship()                       [bidding during open window]
+Predictor → PredictionEngine.submitPrediction(...)               [wager in USDC; 1% fee → Treasury.CAT_FEE]
+Anyone    → PredictionEngine.closeBounty(bountyId)               [Open → Closed; passthrough to BountyManager (§10.2)]
+Oracle    → PredictionEngine.resolve() OR resolveAsInvalid()
+Anyone    → PredictionEngine.submitCutoffHint(bountyId, score)   [§11 Pass 2; permissionless; may overwrite a previously failed hint]
+Anyone    → PredictionEngine.settle(startIndex, endIndex)        [paginated; advances Pass 1 → Pass 2 → Pass 3 → Pass 4]
+  ├─ Pass 1: score computation (per prediction)
+  ├─ Pass 2: cutoff hint paginated verification (§11)
+  ├─ Pass 3: aggregate accumulator + RewardDistributor.reserveRewards(bountyId, ...)
+  ├─ Pass 4: per-predictor USDC payout assignment
+  └─ Final finalization (triggered on the call that completes Pass 4):
+       ├─ Pool 2 transfers: 30% consolation + 30% victory bonus per top/bottom predictor row
+       ├─ Pool 2 platform: 20% buyback (Treasury.CAT_BUYBACK), 10% team (direct), 10% DAO (Treasury.CAT_DAO)
+       ├─ Pool 2 Slice A redirect: if B = ∅, consolation → Treasury.CAT_P2_UNALLOCATED (§5.5)
+       ├─ Pool 3: RewardDistributor.assignRewards(...) (paginated) then finalizeRewards()
+       └─ BountyManager.markSettled(bountyId, topGroupCount)
+Winner    → PredictionEngine.claim()                             [pull USDC payout AND atomically claims PSYH via RewardDistributor.claimTokens]
+Sponsor   → BountyManager.claimSponsorshipRefund()               [only if Invalidated, Cancelled, or zero-predictor settled]
 ```
+
+Pool 2 split is `30 / 30 / 20 / 10 / 10` (consolation / victory / buyback / team / DAO); see §5.5 for full pool semantics. Pool 3 lifecycle is `reserveRewards → assignRewards → finalizeRewards → claimTokens` (replaces V0.30's `distributeRewards` array call); see §10.3.
 
 ---
 
@@ -206,12 +231,9 @@ Higher score is better. Range `[0, 2×WAD]`.
 **Numerical proposition:**
 ```
 rawError = computeAbsoluteError(predictedValueWad, resolvedValueWad)
+score    = WAD_SQUARED / max(rawError, MIN_BRIER)
 ```
-Used directly for ranking. Lower `rawError` is better. For score-weighted allocation (required in Pool 2 consolation/victory and Pool 3 quality slice), convert:
-```
-score = WAD_SQUARED / max(rawError, MIN_BRIER)
-```
-This gives higher values for better predictions, symmetric with the discrete case.
+`score` is high-is-better and is the **only** quantity used for ranking, top-50% cutoff (§5.3), and all score-weighted allocation (Pool 2 consolation / victory and Pool 3 quality slice). `rawError` is an internal intermediate; `score` is the canonical numerical output, symmetric with the discrete case.
 
 ### 5.3 Ranking and Top-50% Cutoff
 
@@ -349,14 +371,17 @@ No fee on Pool 2 (sponsors already pay via the 20% buyback + 10% team + 10% DAO 
 
 **Invariant (protocol total):** `Σ feeAmount_i for all i == platformFeeBalance(bountyId)` at any time.
 
-### 5.8 Invalidation and Total Refund
+### 5.8 Invalidation and Refund
 
 If the oracle calls `resolveAsInvalid()`:
 
-- All predictors get 100% wager refund. No ranking, no scoring, no $PSYH minting.
-- Sponsors get 100% deposit refund via `BountyManager.claimSponsorshipRefund()`.
-- No fees collected.
-- `BountyState` transitions to `Invalidated` then `Settled` after refunds processed.
+- **Predictors get `effectiveWager` refund** (= `rawWager × 0.99`, the same quantity that would have entered Pool 1 distribution). The 1% submission fee already committed to `Treasury.CAT_FEE` at submission (§5.7) is **non-refundable** under invalidation. Rationale: per-predictor pre-deduction (§5.7) commits the fee at submission as a one-way protocol-usage charge; a paid invalidation refund must not require Treasury fee clawback (which would add a new outbound role-gated path on Treasury and complicate accounting). Predictors are made aware of this in the front-end submission flow.
+- **Sponsors get 100% deposit refund** via `BountyManager.claimSponsorshipRefund()` (Pool 2 platform take is only triggered by Pool 2 distribution, which does not run under invalidation; sponsor pools accrue zero protocol take when invalidated).
+- No additional protocol take is collected at invalidation; only the previously committed `CAT_FEE` balance remains in Treasury.
+- No ranking, no scoring, no $PSYH minting.
+- `BountyState` transitions to `Invalidated` and is marked `Settled` immediately (refunds are pull-based; the eligibility predicate is permanent — see §10.1 `isRefundable` and `claimSponsorshipRefund`).
+
+**Invariant.** `Σ effectiveWager_refunded == Σ effectiveWager_at_submission` (full refund of the post-fee principal, paid out of the PE-held escrow). `Σ feeAmount` previously routed to `Treasury.CAT_FEE` is unaffected by invalidation.
 
 ### 5.9 Edge Cases
 
@@ -447,7 +472,7 @@ The function reads `currentK()`, computes the requested allocation, clamps it to
 
 This eliminates V0.30's race condition where a late `claimTokens()` for an old bounty could be reduced because a newer high-volume bounty later in the same month consumed the cap. Each bounty's `kWad` is fixed at reservation; the cap is always evaluated against the bounty that arrived first.
 
-If `reserveRewards` is called and the month's cap is fully exhausted (`effectiveKWad == 0`), the bounty proceeds to settlement with **zero Pool 3 reward** (Pool 1 and Pool 2 still distribute normally). The `KCoefficientUpdated(0)` event is emitted for off-chain monitoring.
+If `reserveRewards` is called and the month's cap is fully exhausted (`effectiveKWad == 0`), the bounty proceeds to settlement with **zero Pool 3 reward** (Pool 1 and Pool 2 still distribute normally). The `KCoefficientObserved(month, 0)` event is emitted for off-chain monitoring (see §10.3 events block).
 
 ### 6.5 Buyback & Burn
 
@@ -676,8 +701,11 @@ struct Prediction {
 
     // Computed during settlement
     uint256 score;                      // WAD-scaled, high-is-better (§3.3); filled in Pass 1
-    bool inTopGroup;                    // set in Pass 2 after cutoff hint verified
     bool processed;                     // settlement Pass 4 visited this prediction
+    // Note (V0.31, decision: D2-b + Opt-α). Top-group membership is NOT stored per
+    // prediction. Pass 3/4 compute it lazily as `score >= SettlementState.topGroupCutoffScore`.
+    // This keeps Pass 2 hint verification idempotent: a failed hint requires no per-prediction
+    // rollback — only the SettlementState counters reset (see §11 Pass 2 + §10.2 submitCutoffHint).
 
     // Claimable amounts (filled by settle())
     uint256 usdcPayout;                 // Pool 1 payout + Pool 2 slice (consolation or victory)
@@ -787,8 +815,8 @@ uint256 constant K_WAD_PHASE1 = 10 * 1e18;          // months 1–3
 uint256 constant K_WAD_PHASE2 =  5 * 1e18;          // months 4–6
 uint256 constant K_WAD_PHASE3 =  2 * 1e18;          // months 7–12
 uint256 constant K_WAD_PHASE4 =  1 * 1e18;          // months 13–24
-uint256 constant K_WAD_PHASE5 = 0.5 * 1e18 / 1;     // months 25–36 (encoded as 5e17 in actual code)
-uint256 constant K_WAD_PHASE6 = 0.25 * 1e18 / 1;    // months 37–48 (encoded as 2.5e17)
+uint256 constant K_WAD_PHASE5 = 5e17;               // 0.5 × 1e18 — months 25–36
+uint256 constant K_WAD_PHASE6 = 25e16;              // 0.25 × 1e18 — months 37–48
 uint256 constant K_WAD_PHASE7 = 0;                  // months 49+
 
 // Mining bucket bound (decision 5: cap, not pre-mint)
@@ -802,7 +830,7 @@ bytes32 constant CAT_DUST            = keccak256("DUST");
 bytes32 constant CAT_P2_UNALLOCATED  = keccak256("P2_UNALLOCATED");   // V0.31 NEW
 ```
 
-> **Note on K_WAD_PHASE5/6 encoding.** Solidity does not allow non-integer literal expressions like `0.5 * 1e18` directly. Implementations should declare `K_WAD_PHASE5 = 5e17` and `K_WAD_PHASE6 = 25e16` literally; the decimals comments above are documentation. The library's `currentK()` selects from these constants by month.
+> **Note on K schedule.** Constants above are written in their compilable WAD form. The library's `currentK()` selects from `K_WAD_PHASE1..7` by month according to §6.4 tier boundaries.
 
 > **Storage layout note.** All upgradeable contracts must reserve `uint256[50] private __gap;` at end of storage per §2; combined with the explicit `__reservedForV04` slots in `Bounty` / `Prediction` / `SettlementState`, V0.4 can extend storage without disturbing layout. See §12.7.
 
@@ -824,7 +852,6 @@ interface IBountyManager {
         PrivacyMode privacyMode
     );
     event SponsorshipDeposited(uint256 indexed bountyId, address indexed sponsor, uint256 totalContribution);
-    event SponsorCapReached(uint256 indexed bountyId, uint256 sponsorCount);  // emitted on the call that fills the 100th slot
     event BountyStateChanged(uint256 indexed bountyId, BountyState oldState, BountyState newState);
     event SponsorTierAssigned(uint256 indexed bountyId, address indexed sponsor, uint256 rank, uint64 tier, uint64 accessUnlock);
     event SponsorRefundClaimed(
@@ -834,6 +861,13 @@ interface IBountyManager {
         RefundReasonCode reasonCode
     );
     event BountyResolvedAt(uint256 indexed bountyId, uint256 resolvedAt);  // mirror to PE event for off-chain indexers
+
+    // ─── Errors ───────────────────────────────────────────────────────────────
+
+    /// @notice Reverted by addSponsorship() when a NEW (previously unseen) sponsor address
+    /// attempts to enroll past MAX_SPONSORS_PER_BOUNTY = 100. Existing sponsors topping up
+    /// after the cap is reached do NOT trigger this error.
+    error SponsorCapReached(uint256 bountyId, uint256 currentSponsorCount);
 
     // ─── Public lifecycle (sponsor / admin) ───────────────────────────────────
 
@@ -955,6 +989,16 @@ interface IPredictionEngine {
         bytes calldata encryptedPayload         // V0.3 MUST be empty; V0.4 carries ciphertext
     ) external;
 
+    // ─── Closing (anyone, post-closeTimestamp) ────────────────────────────────
+
+    /// @notice Permissionless passthrough to BountyManager.closeBounty(bountyId), which
+    /// is otherwise PREDICTION_ENGINE_ROLE-gated. Transitions Open → Closed. Idempotent.
+    /// Reverts if called before Bounty.closeTimestamp. PE may also call BountyManager.closeBounty
+    /// internally as part of the first submitPrediction()/resolve() that arrives after
+    /// closeTimestamp; this explicit function exists so any party can force the transition
+    /// without performing another action.
+    function closeBounty(uint256 bountyId) external;
+
     // ─── Resolution (oracle) ──────────────────────────────────────────────────
 
     /// @notice Only ORACLE_ROLE. Calls BountyManager.markResolved internally.
@@ -965,16 +1009,26 @@ interface IPredictionEngine {
         uint8 resolvedDecimals
     ) external;
 
-    /// @notice Only ORACLE_ROLE. Calls BountyManager.markInvalidated. Allows total refund
-    /// of predictor wagers and sponsor deposits. May be called pre- or post-close.
+    /// @notice Only ORACLE_ROLE. Calls BountyManager.markInvalidated. Allows refund
+    /// of predictor effective wagers and sponsor deposits per §5.8. May be called pre- or
+    /// post-close. The 1% submission fee already committed to Treasury.CAT_FEE is NOT
+    /// refunded (decision: per-predictor pre-deduction is non-reversible, see §5.7 / §5.8).
     function resolveAsInvalid(uint256 bountyId) external;
 
     // ─── Settlement (paginated, see §11) ──────────────────────────────────────
 
     /// @notice Submit the off-chain-computed cutoff score for top-50% determination.
-    /// Permissionless. Must be called once after Pass 1 completes and before Pass 2 verification
-    /// can proceed. Idempotent only if the same score was previously accepted; otherwise reverts
-    /// (re-submission requires a state-machine reset path not exposed in V0.3).
+    /// Permissionless. Callable once Pass 1 has completed and Pass 2 has not yet been
+    /// verified. If a previous hint failed verification, this call OVERWRITES it AND
+    /// resets the Pass 2 cursor + counters (cutoffStrictlyAboveCount / cutoffAtCutoffCount /
+    /// settledUpTo) so paginated verification can restart from index 0 against the new
+    /// score. Reverts if Pass 2 verification has already succeeded (passCompletedFlags bit 1
+    /// set). Idempotent if called with the same score already pending verification (no
+    /// state change).
+    /// @dev See §11 Pass 2 for the full state machine. Per V0.31 Opt-α design,
+    /// `prediction.inTopGroup` is NOT a storage field — top-group membership is computed
+    /// lazily in Pass 3/4 against SettlementState.topGroupCutoffScore. This means hint
+    /// reset is O(1) on storage (only counters reset); no per-prediction rollback needed.
     function submitCutoffHint(uint256 bountyId, uint256 cutoffScore) external;
 
     /// @notice Permissionless. Multi-pass paginated settlement; see §11.
@@ -1184,18 +1238,51 @@ The most complex function in the protocol. Specification is normative — implem
 ### State machinery (mirrors §9 SettlementState)
 
 ```
-currentPass        // 1, 2, 3, or 4 — which pass settle() is currently advancing
+currentPass        // 0 (uninitialized / pre-Pass-1) | 1 | 2 | 3 | 4 — pass settle() is advancing
 settledUpTo        // pagination cursor within currentPass; reset to 0 when pass advances
-passCompletedFlags // bit i set when pass i complete
+passCompletedFlags // bit i set when pass i complete (bit 0 = Pass 1, bit 1 = Pass 2, …)
 ```
 
-Pass advancement: when `settledUpTo == totalPredictors` for a given pass, the contract:
+`currentPass == 0` is the implicit pre-settlement state on a freshly resolved bounty. The first `settle()` call lazily advances it to 1 (or short-circuits to Settled if `totalPredictors == 0`). Pass advancement: when `settledUpTo == totalPredictors` for a given pass, the contract:
+
 1. Sets the corresponding bit in `passCompletedFlags`.
 2. Increments `currentPass` to the next pass.
 3. Resets `settledUpTo` to 0.
 4. Performs any once-per-pass aggregate finalization (e.g., Pass 2 hint verification, Pass 3 reservation).
 
 The next `settle()` call enters the next pass.
+
+### State initialization and mirroring
+
+`SettlementState` is zero-initialized (Solidity default) at bounty creation. Over the bounty lifecycle:
+
+| Trigger | Caller | `SettlementState` fields written |
+|---|---|---|
+| `PredictionEngine.resolve(bountyId, value, decimals)` | ORACLE_ROLE → PE; PE calls `BountyManager.markResolved` AND writes own state | `resolved = true`, `resolvedValue = value`, `resolvedDecimals = decimals` |
+| `PredictionEngine.resolveAsInvalid(bountyId)` | ORACLE_ROLE → PE; PE calls `BountyManager.markInvalidated` | `isInvalidated = true` |
+| First `settle()` after `resolve()` (non-zero predictors) | anyone → PE | `currentPass` lazily advances 0 → 1 |
+| First `settle()` after `resolve()` (zero predictors) | anyone → PE | `fullySettled = true`, then `BountyManager.markSettled(bountyId, 0)`; emits `NoSignalSettled` |
+| Pass advancement | PE inside `settle()` | `passCompletedFlags`, `currentPass`, `settledUpTo` reset; once-per-pass aggregates (see Pass-specific sections) |
+| `submitCutoffHint` (Step 2A) | anyone → PE | `cutoffHintScore`, `cutoffHintSubmitted = true`; on overwrite path also zero `cutoffStrictlyAboveCount`, `cutoffAtCutoffCount`, `settledUpTo` |
+| Pass 2 verification success | PE inside `settle()` | `topGroupCutoffScore`, `topGroupCount` |
+| Pass 3 finalization | PE inside `settle()` | `p1TopPrincipal`, `p1RemainderAmount`, `p1SumTopScoreEffWager`, `p2SumTopScoreEffWager`, `p2SumBottomScoreEffWager`, `reservedTokenAllocation`, `effectiveKWad` |
+| Pass 4 / Final Finalization | PE inside `settle()` | `sumPool1PayoutTop` (accumulated across pages), `fullySettled = true` on the final page |
+
+`SettlementState` lives in PredictionEngine storage. `Bounty.state` (in BountyManager) is the authoritative bounty-state machine; the `resolved` / `isInvalidated` flags on `SettlementState` are PE-local convenience mirrors set in the same transaction as the corresponding BM mutator.
+
+### Events emitted during settlement
+
+All events are declared on `IPredictionEngine` (§10.2) unless noted.
+
+| Event | Emitted at |
+|---|---|
+| `CutoffHintSubmitted(bountyId, cutoffScore, submitter)` | Step 2A success (incl. overwrite of a previously failed hint) |
+| `CutoffHintVerified(bountyId, cutoffScore, topGroupCount)` | Pass 2 final-page verification check passes |
+| `SettlementProgressed(bountyId, currentPass, settledUpTo, totalPredictors)` | End of every `settle()` call that **did not** complete a pass. Off-chain consumers use this to observe pagination progress. |
+| `NoSignalSettled(bountyId)` | Zero-predictor short-circuit on the first `settle()` after `resolve()` |
+| `SettlementComplete(bountyId, topGroupCount)` | Final finalization (Pass 4 → Settled) |
+| `RewardsReserved` / `RewardsAssigned` / `RewardsFinalized` | Emitted by `IRewardDistributor` (§10.3) on `reserveRewards` / `assignRewards` / `finalizeRewards` calls during Pass 3 + Final Finalization |
+| `PayoutClaimed(bountyId, predictor, usdcAmount, tokenAmount)` | `claim()` |
 
 ### Pass 1 — Score Computation
 
@@ -1212,17 +1299,25 @@ When `settledUpTo == totalPredictors`, set `passCompletedFlags |= 0b0001`, advan
 
 ### Pass 2 — Cutoff Hint Submission and Verification
 
-This pass uses a **permissionless off-chain hint + on-chain paginated verification** model (decision 4 of L1.B; cutoff hint trust is fixed to permissionless in V0.31, no oracle gate, no bond).
+This pass uses a **permissionless off-chain hint + on-chain paginated verification** model (decision 4 of L1.B; cutoff hint trust is fixed to permissionless in V0.31, no oracle gate, no bond). Per V0.31 Opt-α, top-group membership is **not** persisted on the `Prediction` struct during Pass 2; only the per-bounty counters in `SettlementState` are mutated. Pass 3 / Pass 4 derive top-group membership lazily as `score >= topGroupCutoffScore`. This keeps Pass 2 idempotent across hint replacements: a failed hint costs no per-prediction storage rollback.
 
-**Step 2A — Hint submission (anyone, called once between Pass 1 completion and Pass 2 verification start).** `submitCutoffHint(bountyId, cutoffScore)` records the proposed cutoff in `SettlementState.cutoffHintScore` and sets `cutoffHintSubmitted = true`. If a hint already exists for this bounty, revert (V0.3 does not support hint revision; if a hint fails verification, the bounty enters a stuck state requiring oracle invalidation — acceptable for V0.3, may be improved in V0.4).
+**Step 2A — Hint submission (anyone, callable while Pass 1 is complete and Pass 2 is not yet verified).** `submitCutoffHint(bountyId, cutoffScore)` semantics:
 
-**Step 2B — Paginated verification.** For each prediction in `[startIndex, endIndex)`:
+- Reverts if Pass 1 has not completed (`passCompletedFlags & 0b0001 == 0`).
+- Reverts if Pass 2 verification has already succeeded (`passCompletedFlags & 0b0010 != 0`).
+- If `cutoffHintSubmitted == true` AND the new `cutoffScore` matches the pending one: idempotent (no state change).
+- Otherwise (no pending hint, OR pending hint differs): writes `cutoffHintScore = cutoffScore`, sets `cutoffHintSubmitted = true`, and **resets** the Pass 2 cursor and counters: `cutoffStrictlyAboveCount = 0`, `cutoffAtCutoffCount = 0`, `settledUpTo = 0`. Emits `CutoffHintSubmitted(bountyId, cutoffScore, msg.sender)`.
+
+A hint that fails Step 2B's final-page verification revert is therefore naturally **replaceable**: any party calls `submitCutoffHint` again with a corrected score; the per-bounty counters reset to zero, and Step 2B re-runs paginated against the new hint. No `Prediction`-struct rollback is needed (because Step 2B writes none).
+
+**Step 2B — Paginated verification (called via `settle(bountyId, startIndex, endIndex)` while `currentPass == 2`).** For each prediction in `[startIndex, endIndex)`:
 
 1. Read the prediction's `score` from storage (set in Pass 1).
 2. If `score > cutoffHintScore`: increment `cutoffStrictlyAboveCount`.
 3. If `score == cutoffHintScore`: increment `cutoffAtCutoffCount`.
-4. If `score >= cutoffHintScore`: also set `prediction.inTopGroup = true`.
-5. Increment `settledUpTo`.
+4. Increment `settledUpTo`.
+
+(No write to the `Prediction` struct in this pass — Opt-α design; see §9 Prediction note.)
 
 When `settledUpTo == totalPredictors`, perform the verification check:
 
@@ -1237,21 +1332,22 @@ require(cutoffStrictlyAboveCount <= targetCount, "hint too low");
 require(topCount >= targetCount, "hint too high");
 ```
 
-If both pass: set `topGroupCutoffScore = cutoffHintScore`, `topGroupCount = topCount`, set `passCompletedFlags |= 0b0010`, emit `CutoffHintVerified(bountyId, cutoffScore, topCount)`, advance to Pass 3.
+If both pass: set `topGroupCutoffScore = cutoffHintScore`, `topGroupCount = topCount`, set `passCompletedFlags |= 0b0010`, emit `CutoffHintVerified(bountyId, cutoffScore, topCount)`, advance to Pass 3 (`currentPass = 3`, `settledUpTo = 0`).
 
-If either fails: revert (the hint was invalid). The transaction's effects (`inTopGroup` flags set during this pagination) must be in-memory or rolled back by revert; `settledUpTo` is also rolled back. The submitter must call `submitCutoffHint` again with a corrected score. (V0.3 caveat: if no correct hint is ever submitted, bounty stays stuck. V0.4 may add a hint-replace path.)
+If either check fails: **revert**. The submitter (or any subsequent party) calls `submitCutoffHint` again with a corrected `cutoffScore` — Step 2A semantics zero out the counters and `settledUpTo`, and Step 2B restarts from index 0 against the new hint. **DoS asymmetry**: an attacker pays full gas per failed `submitCutoffHint` + partial Step 2B verification before revert; the defender's correct hint resolves the bounty permanently. This permissionless-no-bond design is deemed sufficient for V0.3 launch (see §12.5); if observed in production, V0.4 may introduce a refundable bond.
 
 ### Pass 3 — Accumulator Pass + Reservation
 
 For each prediction in `[startIndex, endIndex)`:
 
-1. If `inTopGroup`:
+1. Compute top-group membership lazily: `inTopGroup_i = (prediction.score >= SettlementState.topGroupCutoffScore)`. Per V0.31 Opt-α, this is **not** persisted on the `Prediction` struct — it is re-derived in every pass that needs it. The cost is one storage read of `topGroupCutoffScore` per `settle()` call (hot after first access in the same transaction) plus one comparison per prediction.
+2. If `inTopGroup_i`:
    - `p1TopPrincipal += effectiveWager`
    - `p1SumTopScoreEffWager += (score × effectiveWager) / WAD`
    - `p2SumTopScoreEffWager += (score × effectiveWager) / WAD`
-2. Else (in bottom group):
+3. Else (in bottom group):
    - `p2SumBottomScoreEffWager += (score × effectiveWager) / WAD`
-3. Increment `settledUpTo`.
+4. Increment `settledUpTo`.
 
 When `settledUpTo == totalPredictors`, perform once-per-bounty finalization:
 
@@ -1283,9 +1379,13 @@ Set `passCompletedFlags |= 0b0100`, advance to Pass 4.
 
 ### Pass 4 — Per-Predictor Payout Assignment
 
+Pass 4 reads three persisted aggregates (`p1RemainderAmount`, `p1SumTopScoreEffWager`, `p2SumTopScoreEffWager`, `p2SumBottomScoreEffWager` on `SettlementState`) and **recomputes** the Pool 2 splits (`p2Consolation`, `p2Victory`, etc.) at the entry of each `settle()` call from `bounty.totalSponsorAmount` and the `P2_*_BPS` constants. These splits are deterministic functions of immutable inputs; recomputing per call is cheaper (a few `mulDiv`s) than persisting five additional `SettlementState` slots.
+
 For each prediction in `[startIndex, endIndex)`:
 
-If `inTopGroup`:
+Compute top-group membership lazily: `inTopGroup_i = (prediction.score >= SettlementState.topGroupCutoffScore)` (Opt-α; not stored).
+
+If `inTopGroup_i`:
 ```
 remainderShare = mulDiv(p1Remainder,
                          score × effectiveWager,
@@ -1367,6 +1467,13 @@ Empirical batch tuning is implementation-time work in T4.3a–T4.3e.
 - **Added:** Final-finalization paginated assignment via `assignRewards` / `finalizeRewards` (replaces V0.30's monolithic `distributeRewards` array call).
 - **Added:** explicit zero-predictor short-circuit at start of `settle()`.
 - **Added:** Slice A → `CAT_P2_UNALLOCATED` redirect when `B = ∅`.
+
+### Post-T0.B review revisions (V0.31 internal)
+
+- **Removed:** `prediction.inTopGroup` storage field (was set in Pass 2). Top-group membership is now computed lazily in Pass 3 and Pass 4 as `score >= SettlementState.topGroupCutoffScore` (Opt-α design). Rationale: makes Pass 2 idempotent so failed cutoff hints can be replaced without per-prediction rollback.
+- **Changed:** `submitCutoffHint` is now **replaceable** on verification failure. A new submission with a different score zeroes `cutoffStrictlyAboveCount`, `cutoffAtCutoffCount`, and `settledUpTo` so Pass 2 verification restarts from index 0. The previous "first-write-wins, fail → bounty stuck → oracle invalidate" path is removed.
+- **Clarified:** Pass 4 / Final Finalization recomputes Pool 2 splits (`p2Consolation`, `p2Victory`, `p2Buyback`, `p2Team`, `p2Dao`) from `bounty.totalSponsorAmount` at each `settle()` entry rather than persisting them on `SettlementState`. Inputs are immutable; recompute is cheaper than 5 storage slots.
+- **Added:** explicit `IPredictionEngine.closeBounty(bountyId)` passthrough (anyone, post-`closeTimestamp`) routing to `BountyManager.closeBounty` (PE-role-gated). Without this, the "anyone forces Open → Closed" path stated in §10.1 was inaccessible.
 
 ---
 
@@ -1515,7 +1622,7 @@ Each subtask (see §15) includes its own tests. Integration-level requirements:
 
 ### 14.2 Edge cases and refund paths
 
-- **Invalidation test:** full flow ending in `resolveAsInvalid` with all predictor wagers + sponsor deposits refunded; `RefundReasonCode == INVALIDATED`.
+- **Invalidation test:** full flow ending in `resolveAsInvalid`. Verify each predictor receives back exactly `effectiveWager_i` (= `rawWager_i × 0.99`), NOT `rawWager_i` — the 1% submission fee is non-refundable per §5.8 (D1-b). Verify sponsors get 100% deposit refund. Verify `Treasury.categoryBalance(CAT_FEE)` for this bounty equals `Σ feeAmount_i` and is unchanged by `resolveAsInvalid`. `RefundReasonCode == INVALIDATED`.
 - **Cancel test:** `cancelBounty` in Open state with no predictions / sponsorships — confirm cancellation; subsequent `addSponsorship` reverts.
 - **No-signal test (V0.31 NEW):** create bounty + sponsor, no predictions submitted, `closeBounty` then `resolve()`, then `settle()` short-circuits to `Settled` with `NoSignalSettled` event; sponsors refundable with `reasonCode == NO_SIGNAL`.
 - **Tie-handling test:** ≥ 20% of predictors score exactly at cutoff; verify all ties enter top group; `topGroupCount` exceeds `ceil(n/2)` by the tie span.
@@ -1527,7 +1634,11 @@ Each subtask (see §15) includes its own tests. Integration-level requirements:
 - **Per-predictor fee invariant (V0.31 NEW):** for every prediction, `rawWager == effectiveWager + feeAmount`, exact. Property test (≥ 1000 random submissions).
 - **Effective-wager-only math invariant (V0.31 NEW):** in any settled bounty, `Σ pool1Payout_i for i ∈ T == Σ effectiveWager_i for all i` (modulo dust). Property: `rawWager` never appears as a coefficient in any pool math.
 - **Score-0 fallback test (V0.31 NEW):** craft a Discrete bounty where every predictor's `confidenceBpsArray` puts 100% on the wrong option (so all Brier scores = 2 × WAD → score = 0). Verify Pool 2 Slice A and Pool 3 quality slice both fall back to effectiveWager weighting and complete settlement without revert.
-- **Sponsor cap test (V0.31 NEW):** add 100 sponsors (each `addSponsorship` once); 101st `addSponsorship` from a NEW address reverts with `SponsorCapReached`; existing sponsor calling `addSponsorship` again succeeds.
+- **Sponsor cap test (V0.31 NEW):** add 100 sponsors (each `addSponsorship` once); 101st `addSponsorship` from a NEW address reverts with `SponsorCapReached(bountyId, 100)` (declared as a Solidity custom error in §10.1, not an event); existing sponsor calling `addSponsorship` again succeeds.
+
+- **Cutoff hint replacement test (V0.31 NEW, D2-b + Opt-α):** Pass 2 verification fails on a too-low hint (e.g., propose `cutoffScore = 0`, paginate, expect `"hint too low"` revert at final page). Submit a corrected hint via `submitCutoffHint` from a different address, then re-paginate Pass 2 — verify it succeeds. Assert no `Prediction.inTopGroup` storage was written or rolled back (the field does not exist in V0.31). Assert per-bounty counters reset to zero after the second `submitCutoffHint`. Assert `CutoffHintSubmitted` was emitted twice (once per submission).
+- **Cutoff hint idempotent re-submission (V0.31 NEW):** call `submitCutoffHint(bountyId, X)` twice with the same `X` — second call is a no-op (no state change, no event).
+- **`closeBounty` passthrough test (V0.31 NEW):** create bounty, advance time past `closeTimestamp` without any predictions or other actions, call `PredictionEngine.closeBounty(bountyId)` from a non-PE-role address — succeeds; `Bounty.state` transitions to `Closed`; subsequent `submitPrediction` reverts. Calling `closeBounty` before `closeTimestamp` reverts.
 - **`finalizeSponsorRanking` gas test (V0.31 NEW):** with exactly 100 sponsors, measure gas; assert under 12M (well within block limit). With 101+ sponsors the test cannot reach this state because `addSponsorship` rejects.
 - **`encryptedPayload` empty enforcement (V0.31 NEW):** all V0.3 `submitPrediction` calls with non-empty `encryptedPayload` revert. Property test with random byte arrays.
 - **`PrivacyMode == Transparent` enforcement (V0.31 NEW):** `createBounty` with `OracleEncrypted` or `ThresholdEncrypted` reverts.
@@ -1623,17 +1734,17 @@ These are the recommended subtasks for parallel development in independent conve
 
 **T3.1 Treasury**
 - Proxy-upgradeable
-- Category-labeled fund receipt (§10.4)
-- DAO sub-account accounting
-- `pendingBuybackBalance()` and `scheduleBuyback()` hooks
+- Category-labeled fund receipt for `CAT_FEE / CAT_BUYBACK / CAT_DAO / CAT_DUST / CAT_P2_UNALLOCATED` (§10.4)
+- DAO sub-account accounting (incl. `CAT_P2_UNALLOCATED` per decision 3)
+- `pendingBuybackBalance()` and `pullBuybackForEpoch()` hooks (BuybackExecutor pulls per epoch; epoch tracking authoritative on Treasury side, see §10.4 V0.31 delta)
 - Depends on: T1.1, T1.2, T1.3
 
 **T3.2 RewardDistributor**
 - Proxy-upgradeable
-- Tracks pending mints per `(bountyId, predictor)`
-- Implements K schedule (§6.4)
-- Monthly cap enforcement with auto-reduction
-- `claimTokens()` mints from PsychohistoryToken
+- Implements `reserveRewards / assignRewards / finalizeRewards / claimTokens` lifecycle (§10.3)
+- K schedule per §6.4; `effectiveKWad` clamped to monthly-cap headroom **at reservation time** (decision 7), not at claim time
+- Tracks per-bounty `(reservedAmount, effectiveKWad)`; monthly cap consumed at `reserveRewards`
+- `claimTokens()` mints from PsychohistoryToken on demand against `mintingCapRemaining` (decision 5: mint-on-demand, not pre-mint)
 - Depends on: T1.1, T1.2, T1.3, T2.2 (token address)
 
 **T3.3 BountyManager**
@@ -1690,9 +1801,10 @@ V0.30's L2-T5 grouped Router + BuybackExecutor with no shared dependency. V0.31 
 ### Tier 6 — Deployment and Simulation
 
 **T6.1 Deployment script**
-- `script/Deploy.s.sol` following §13
+- `script/DeployCore.s.sol` (Phase 1: token, Treasury, RewardDistributor, BountyManager, PredictionEngine, Router) per §13.1
+- `script/DeployBuyback.s.sol` (Phase 3: BuybackExecutor activation) per §13.2
 - Supports local Anvil and Sepolia
-- Outputs `deployments.json`
+- Outputs `deployments.json` (Phase 1 emits, Phase 3 augments)
 
 **T6.2 Integration tests**
 - `test/Integration.t.sol`: all scenarios from §14
