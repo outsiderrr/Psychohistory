@@ -50,3 +50,7 @@ lcov.info
 .claude/settings.local.json
 .claude/projects/
 
+# Project-local skill installs (e.g., skills.sh / find-skills via npx skills add)
+# Treat like node_modules — install state, not source
+.agents/
+
