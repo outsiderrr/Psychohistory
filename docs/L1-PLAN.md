@@ -1,9 +1,30 @@
 # Psychohistory V0.3 — L1 Master Plan
 
-**Status**: L1 阶段完成（2026-05-08）
+**Status**: L1 阶段完成（2026-05-08 → 2026-05-09 增补 CEO review 战略决策）
 **Project Version**: V0.3
-**TDD Reference**: [docs/TDD-V0.30.md](TDD-V0.30.md) → 待 L2-T0 升级为 [docs/TDD-V0.31.md](TDD-V0.31.md)
+**TDD Reference**: [docs/TDD-V0.30.md](TDD-V0.30.md) → 升级至 [docs/TDD-V0.31.md](TDD-V0.31.md) → 待 L2-T0.D 升级至 V0.32
+**Strategic decisions**: [DECISIONS.md](DECISIONS.md) 的 ADR-0001 ~ ADR-0014
+**Project standards**: [PROPOSITION_STANDARD.md](PROPOSITION_STANDARD.md)（QPS）
+**Deferred items**: [TODOS.md](TODOS.md)
 **Audience**: L2 阶段规划对话 / L3 子任务实现对话 / 后期审计 review
+
+---
+
+## Project Thesis — Forecaster Scoreboard
+
+> **Psychohistory 是一个 forecaster 的 on-chain scoreboard**——一个让校准能力（calibration）被科学测量、被长期累积、被链上验证的市场。
+>
+> 金融市场无法提供这件事：一笔交易的动机是多元的（投机/对冲/平仓/止损），盈亏归因含糊（运气还是技能？时点对错？），没有清晰的"我作为 forecaster 是不是真的有 alpha"信号。Metaculus / Good Judgment Open 提供 forecaster reputation 但没有 skin in the game。Polymarket 是粗粒度的 binary 市场，不奖励 calibration 精度。
+>
+> Psychohistory 的差异化由三条结构性选择支撑：
+>
+> 1. **Brier-based 校准评分**——奖励概率分布精度，不奖励"押对方向"的二元正确（参 §5.2 Numerical / Discrete scoring）
+> 2. **跨 bounty 累计的 forecaster rating**（ADR-0010）——单题表现可能波动，长期 track record 是真实信号
+> 3. **Top-50% 硬切**——清晰区分 calibrated forecaster 与 noise，scoreboard 有意义的前提
+>
+> 这套设计把目标用户群锁定为 **niche pro-sumer**（量化分析师 / forecasting 爱好者 / macro 研究员 / Metaculus 老用户群），不追求消费级大众化。GTM 节奏是 **right-fit growth**，不是 aggressive growth。
+>
+> 详细 thesis 来源: ADR-0010, L1 CEO Review (2026-05-09)。
 
 ---
 
@@ -204,6 +225,35 @@ e. **不实现 `getAllPredictions(bountyId)` 等批量公开预测函数**，前
 **Rationale**：账目 `totalSupply() == 真实流通量`，攻击面只是单笔发奖额而非 4 亿库存。§4.2 已暗示此方案（明确 `MINTER_ROLE → RewardDistributor`）。
 
 **TDD V0.31 修订**：§6.2 文字明确为按需 mint；§10.3 / §10.6 已隐含。
+
+---
+
+## 4.B L1 CEO Review 战略决策（2026-05-09 ratified）
+
+L1.C 五项决策（§4 above）锁定 V0.31 spec 后，**2026-05-09 的 L1 CEO Review** 在 framing shift（从"创业 PMF 假设"修正为"passion infra + option-on-success"）下补 ratify 了 10 项额外战略决策。这些决策驱动 ADR-0008 ~ ADR-0014 + L2-T0.D spec lock + 多份新文档。
+
+| # | 决定 | 来源 |
+|---|---|---|
+| **S1** | **Mode = HOLD SCOPE**（V0.4 privacy 作为 evidence-driven 可选扩张，不预先开发） | Delta CEO mode reselection |
+| **S2** | **项目 thesis = "Forecaster Scoreboard"**（Brier-based on-chain calibration reputation, niche pro-sumer 用户群） | Hook #1 用户的"心理回报"论证升华 |
+| **S3** | **首个 bounty 类型 = A-1 numerical**（连续值，第一性原理；比 A-2 discrete bin 更 truthful for 数值预测） | Hook #1 用户 push back |
+| **S4** | **题目分布 70% A / 20% B / 10% E**（QPS 下 E 类也可早做，不必等 sponsor curate 阶段） | Hook #1 + ADR-0014 |
+| **S5** | **冷启动 = $200/周 self-sponsor，约 $9K/年** | Hook #4-A |
+| **S6** | **Stop signal = 反应式**（不预定 KPI；按外部信号灵活停止自资助） | Hook #4-B |
+| **S7** | **Owner 不禁止参与预测**——由 QPS（ADR-0014）保证机制层面无解读空间，不需要机制限制 | Hook #4-C + ADR-0014 |
+| **S8** | **Audit 路径 = AI multi-round + 静态分析（Slither/Aderyn/Mythril）+ Immunefi（PSYH 计价）+ open source + testnet 6-12 月** | Q4 audit 决策 |
+| **S9** | **QPS（Qualified Proposition Standard）作为项目级 curation 原则** | ADR-0014 |
+| **S10** | **Jurisdiction 策略 = phased**（testnet 期个人 + 无实体；mainnet 前 8 周启动 Cayman/BVI 基金会注册，本名露面）。Hard triggers 见 [TODOS.md](TODOS.md) | Hook #6 + Q4 jurisdiction |
+
+每条决策的完整 rationale 和 trade-off 分析见 [DECISIONS.md](DECISIONS.md) 对应 ADR。
+
+### S1-S10 的 spec / 文档影响汇总
+
+| 影响层 | 体现 |
+|---|---|
+| Spec patches → V0.32 | ADR-0008（K(t) Brier alignment）、ADR-0009（int256）、ADR-0010（forecaster stats）、ADR-0011（TVL cap）、ADR-0012（Pausable）、ADR-0013（withdrawal time-lock） |
+| 新文档（不动 spec） | [PROPOSITION_STANDARD.md](PROPOSITION_STANDARD.md)（QPS 完整定义 + 例子 + 反例）、[TODOS.md](TODOS.md)（监控项 + jurisdiction 触发条件 + V0.4 candidate） |
+| L1-PLAN.md（本文件） | 新增 Project Thesis 章节 + §4.B 本节 |
 
 ---
 

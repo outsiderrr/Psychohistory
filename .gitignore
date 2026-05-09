@@ -53,4 +53,5 @@ lcov.info
 # Project-local skill installs (e.g., skills.sh / find-skills via npx skills add)
 # Treat like node_modules — install state, not source
 .agents/
+skills-lock.json
 

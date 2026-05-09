@@ -399,9 +399,431 @@ D2-b alone (without Opt-α) is impractical — replacing a hint while `inTopGrou
 
 ---
 
+## ADR-0008 — K(t) mining alignment with Brier philosophy (Pool 3 amount slice score-weighted)
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (round 2, "scoreboard thesis" deepening); L1 ratification in this commit
+**Related**: TDD V0.31 §5.6 (Pool 3 distribution), §11 Pass 4 / Final Finalization; supersedes the V0.31 amount-slice formula by adding score weighting; **subordinate to ADR-0010** (long-term forecaster rating, which makes the scoreboard thesis a project-level principle)
+
+### Context
+
+V0.31 Pool 3 splits 50/50 between **amount slice** (weight = `pool1Payout_i = effectiveWager_i + remainderShare_i`) and **quality slice** (weight = `score_i × effectiveWager_i`).
+
+The CEO review identified an internal contradiction: the protocol's design philosophy is **"reward calibration, not stake size"** (Brier scoring's whole point), and the project's positioning is **"Forecaster Scoreboard"** (ADR-0010). Yet the amount slice rewards predictors purely by Pool 1 winnings — which is dominated by stake size, not calibration quality.
+
+Concrete consequence: a predictor who pushes a large `effectiveWager` with a mediocre Brier score gets disproportionately more PSYH from the amount slice than a predictor with a smaller wager but better calibration. **This is the opposite of what the Brier philosophy and Scoreboard thesis demand.**
+
+A future PSYH holder grievance ("the protocol claims calibration-first but rewards stake-size") becomes a real PR / governance liability.
+
+### Decision
+
+**Change the Pool 3 amount slice formula to add `score` weighting**, identical in spirit to the quality slice but using `pool1Payout` instead of pure `effectiveWager`:
+
+```
+old (V0.31):
+    amountTokens_i = (alloc/2) × pool1Payout_i / Σ(pool1Payout_j for j ∈ T)
+
+new (V0.32):
+    amountTokens_i = (alloc/2) × (score_i × pool1Payout_i) / Σ(score_j × pool1Payout_j for j ∈ T)
+```
+
+The two slices retain a meaningful difference:
+- **Amount slice**: `score × pool1Payout` — rewards holistic predictor success (calibration × actual won-from-pool-1 amount, including the remainder share)
+- **Quality slice**: `score × effectiveWager` — rewards calibration on submitted stake (excludes remainder share)
+
+Both now align with Brier philosophy.
+
+### Rationale
+
+- **Internal coherence**: every distribution math now multiplies by `score`, making "calibration" the primary signal across all rewards
+- **Scoreboard thesis alignment**: PSYH miners are not "people who pushed big stakes" but "calibrated forecasters" (with stake as a secondary multiplier)
+- **PR / governance protection**: no future "the math contradicts the marketing" attack surface
+- **Implementation cost**: single formula change, no new storage, no new state machine
+
+### Consequences
+
+**Positive**:
+- Brier philosophy fully load-bearing across all reward channels
+- Mining incentive aligned with ADR-0010 forecaster rating (future)
+- Score-0 fallback rule from §5.6 already covers the degenerate `Σ(score × pool1Payout) == 0` case (fall back to weighting by `pool1Payout` alone)
+
+**Negative**:
+- Mining incentive at low-score participants drops further (they already get little; now get even less from amount slice). **Acceptable** under Scoreboard framing — calibration is the protocol's value statement.
+- Implementation slightly less symmetric than "amount = winnings" (a clean intuition); now amount = winnings × calibration
+
+**Follow-up**:
+- §5.6 Pool 3 amount slice formula updated in V0.32
+- §11 Pass 4 / Final Finalization computation updated in V0.32
+- L2-T4.3e (Final Finalization) implementation must use new formula
+
+---
+
+## ADR-0009 — int256 for negative-value numerical predictions
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (Hook #1 strategic discussion surfaced concrete user examples); L1 ratification in this commit
+**Related**: TDD V0.31 §9 (`Prediction.predictedValue`), §11 Pass 1 numerical scoring
+
+### Context
+
+CEO review Hook #1 surfaced concrete user examples of qualified propositions, including:
+
+- "美国 2026 中期选举民主党净席位变化 (vs 共和党)" — a **signed integer** (positive = Dem net gain, negative = Rep net gain)
+- "中国 2026 全年汽车出口增量 vs 2025" — could be signed if exports decline
+
+V0.31 declares `Prediction.predictedValue` as `uint256` and `Bounty.resolvedValue` as `uint256`, which **cannot represent negative values**. Workarounds (offset trick: store `value + LARGE_OFFSET`) are unergonomic and error-prone for predictors and oracles.
+
+### Decision
+
+Change `Prediction.predictedValue` and `Bounty.resolvedValue` from `uint256` to `int256` for `PropositionType.Numerical`. `Bounty.resolvedValue` for `PropositionType.Discrete` (winning option index) remains effectively unsigned (use `int256` and assert non-negative on resolve).
+
+`BrierMath` numerical scoring uses `abs(predictedValue - resolvedValue)` for `rawError`, which works on `int256` directly via OpenZeppelin `SignedMath.abs` returning `uint256`.
+
+### Rationale
+
+- **Real user need**: signed numerical events are common (margins, deltas, year-over-year changes)
+- **Storage cost identical**: `int256` and `uint256` both 32 bytes
+- **Library support**: OpenZeppelin `SignedMath` provides safe abs/min/max
+- **No spec ABI risk**: V0.3 has not shipped any contract; ABI change is free
+
+### Consequences
+
+**Positive**:
+- Signed numerical predictions natively supported
+- No offset hacks
+- `predictedDecimals` semantics unchanged (decimals describes scaling, sign is independent)
+
+**Negative**:
+- BrierMath input parameter type change (uint256 → int256 in numerical path)
+- Slight code complexity in `__getRawError` helper (handle signed subtraction)
+- Discrete proposition `resolvedValue` (option index) requires non-negative assert in resolve()
+
+**Follow-up**:
+- §9 Prediction struct: `int256 predictedValue` for Numerical
+- §9 Bounty struct: `int256 resolvedValue`
+- §11 Pass 1 numerical scoring: `rawError = SignedMath.abs(predictedValue - resolvedValue)` returns `uint256`
+- BrierMath library: numerical functions accept `int256` predicted, `int256` resolved
+- §10.2 `IPredictionEngine.submitPrediction` parameter type: `int256 predictedValue`
+- §10.2 `IPredictionEngine.resolve` parameter type: `int256 resolvedValue`
+- `IBountyManager.markResolved` parameter type: `int256 resolvedValue`
+
+---
+
+## ADR-0010 — Long-term forecaster rating system (Scoreboard thesis on-chain materialization)
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (Hook #1 "scoreboard psychology" thesis); L1 ratification in this commit
+**Related**: ADR-0008 (Brier alignment subordinate to this); TDD V0.31 §5.2 (scoring), §9 (data structures); supersedes implicit assumption that score is per-bounty only
+
+### Context
+
+The L1 CEO review surfaced a project-level positioning thesis that had been implicit but never articulated:
+
+> **Psychohistory's unique value proposition is being a *Forecaster Scoreboard* — a place where someone's calibration ability is measured, accumulated, and verifiable on-chain. Financial markets cannot deliver this (multiple trade motivations + no clean win/lose anchor); pure prediction sites like Metaculus / Good Judgment Open deliver reputation but no skin-in-the-game.**
+
+V0.31 stores per-bounty `score` on each `Prediction`, but **does not aggregate forecaster performance across bounties**. Every Brier score, win/loss, calibration metric is stranded per-bounty. A user's "long-term track record" exists only as something an off-chain indexer could compute, not as authoritative on-chain state.
+
+This is a **core feature gap** under the Scoreboard thesis. Without on-chain cumulative rating:
+- Front-end / SDK consuming "forecaster reputation" must run their own indexer (forking the protocol's value proposition off-chain)
+- Sponsor analytics SLA (Pool 2 service offering) has no canonical predictor identity to bind to
+- Future feature (e.g., reputation-gated high-value bounties) has no on-chain hook
+- The thesis remains a marketing claim rather than a protocol-level fact
+
+### Decision
+
+Add an on-chain cumulative forecaster rating maintained by `PredictionEngine` and updated during Pass 4 / Final Finalization:
+
+```solidity
+struct CumulativeBrierStats {
+    uint256 totalBountiesParticipated;     // count of bounties this address submitted to and that fully settled
+    uint256 totalRawWagerSubmitted;        // Σ rawWager
+    uint256 totalEffectiveWagerSubmitted;  // Σ effectiveWager
+    uint256 totalScoreSum;                 // Σ score (WAD-scaled)
+    uint256 totalScoreWeightedByWager;     // Σ (score × effectiveWager / WAD), the calibration-weighted activity
+    uint256 winsCount;                     // count of bounties where address was in top group
+    uint256 lastUpdatedAt;                 // block.timestamp of last update (deterministic ordering aid)
+}
+
+mapping(address => CumulativeBrierStats) public forecasterStats;
+```
+
+Updated by `PredictionEngine` Pass 4 per-predictor as part of the existing per-prediction processing loop. Read via:
+
+```solidity
+function getForecasterStats(address predictor) external view returns (CumulativeBrierStats memory);
+function getForecasterAverageScore(address predictor) external view returns (uint256);  // totalScoreSum / totalBountiesParticipated, score-0 fallback if 0 bounties
+function getForecasterWinRate(address predictor) external view returns (uint256);  // winsCount × WAD / totalBountiesParticipated
+```
+
+These reads enable front-end leaderboards, reputation-aware sponsor analytics, and future protocol-level features (gated bounties, fee discounts for high-rated forecasters, etc.).
+
+### Rationale
+
+- **Scoreboard thesis becomes load-bearing on-chain fact**, not a marketing claim
+- **Single source of truth** for forecaster reputation (no indexer divergence)
+- **Foundation for future features** without retroactive migration (gated bounties, reputation-weighted sponsor analytics, etc.)
+- **Storage cost minimal**: 7 uint256 + 1 timestamp per active forecaster = 8 storage slots; cold init 320 gas, warm update ~5K gas — negligible vs settlement gas
+- **Update happens during existing Pass 4 loop**: no new pass, no new state machine
+
+### Consequences
+
+**Positive**:
+- Forecaster reputation queryable on-chain
+- Scoreboard thesis backed by deterministic state
+- Future features (reputation-gating, leaderboards, badges) buildable without spec changes
+
+**Negative**:
+- Storage write per predictor per settlement (extra ~5K gas warm / ~20K gas cold per predictor in Pass 4)
+- For 1000-predictor bounty: extra ~5M-20M gas across pagination, ~$1-4 mainnet — acceptable
+- One-time consideration: on bounty invalidation / abandonment refund (ADR-0006 / future ADR), do the stats update? **Decision: stats update only on successful settlement (Bounty.state == Settled with totalPredictors > 0)**, NOT on Invalidated / Abandoned / NoSignal paths. Invalidated bounties have no Brier scoring ran, so no stats to update.
+
+**Follow-up**:
+- §9 add `CumulativeBrierStats` struct + `forecasterStats` mapping
+- §10.2 `IPredictionEngine` add 3 view functions
+- §11 Pass 4 / Final Finalization: per-predictor update of forecaster stats (only on successful settlement)
+- L2-T4.3d / T4.3e implementation includes this update
+- Front-end / SDK roadmap: leaderboard view consumes these views
+
+---
+
+## ADR-0011 — Launch-time TVL cap per bounty
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (Q4 audit decision: AI-only + compensating controls); L1 ratification in this commit
+**Related**: ADR-0012 (emergency pause), ADR-0013 (withdrawal time-lock); TDD V0.31 §9 (Bounty struct), §10.1 (createBounty), §10.2 (submitPrediction)
+
+### Context
+
+Q4 in the L1 CEO review settled the audit strategy: **AI multi-round review + static analysis + Immunefi PSYH bounty + open source + testnet period**, with **no paid third-party audit**.
+
+This is a defensible passion-infra decision but leaves residual security risk. Compensating controls are required to bound the maximum loss from any single undiscovered vulnerability.
+
+The cleanest control: **cap Total Value Locked (TVL) per bounty**. If a single-bounty vulnerability is exploited, the maximum loss is bounded by the cap, not the full protocol-wide TVL.
+
+### Decision
+
+Add a `tvlCap` field on `Bounty`. Both `submitPrediction` and `addSponsorship` MUST verify:
+
+```
+bounty.totalRawWagerAmount + bounty.totalSponsorAmount + (incoming amount) ≤ bounty.tvlCap
+```
+
+If exceeded, revert with `BountyTvlCapExceeded(bountyId, attempted, cap)`.
+
+`tvlCap` defaults to **10,000 USDC raw (= $10,000)** at protocol launch, settable per-bounty by `createBounty` caller (with `DEFAULT_ADMIN_ROLE` or curator review for higher caps in V0.4).
+
+Cap can be raised post-deployment via a contract upgrade (Transparent Proxy pattern) once protocol shows stable operation (e.g., 6 months without security incidents).
+
+### Rationale
+
+- **Bounded blast radius**: an undiscovered vulnerability in settlement / claim / pool distribution affects at most one bounty's $10K
+- **Slow user onboarding aligned with passion-mode launch**: $10K cap forces predictors to spread across bounties, naturally pacing growth
+- **Reversible**: cap is a number, can be raised; not a structural decision
+- **No contract logic change for the math**: it's just a check at deposit time
+
+### Consequences
+
+**Positive**:
+- Maximum single-bounty loss bounded
+- Forces protocol to grow horizontally (more bounties) before vertically (larger bounties), which spreads risk
+- Easy to reason about in audit substitute
+
+**Negative**:
+- Sophisticated users may want to push more than $10K into a single bounty — initially blocked
+- A wealthy "whale" predictor cannot dominate one bounty (some users might see this as feature, not bug — anti-whale fairness)
+- Sponsor depositing >$10K into one bounty must split across multiple bounties
+
+**Follow-up**:
+- §9 Bounty struct add `uint256 tvlCap`
+- §9 add `MAX_BOUNTY_TVL_CAP` constant or default
+- §10.1 `IBountyManager.createBounty` signature add optional `tvlCap` parameter (default to constant if zero / unspecified)
+- §10.1 add error `BountyTvlCapExceeded(uint256 bountyId, uint256 attempted, uint256 cap)`
+- §10.2 `submitPrediction` and `IBountyManager.addSponsorship` enforce cap check
+- L2-T3.3 / T4.1 implementations include cap test
+- L2-T0.E or future spec lock: review cap value after 6 months operation
+
+---
+
+## ADR-0012 — Emergency pause switch (PausableUpgradeable)
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (Q4 audit compensating controls); L1 ratification in this commit
+**Related**: ADR-0011 (TVL cap), ADR-0013 (withdrawal time-lock); TDD V0.31 §4.2 (access control), §10 (interfaces)
+
+### Context
+
+Companion compensating control to ADR-0011 (TVL cap) for the AI-only audit decision. Even with bounded blast radius per bounty, an exploited vulnerability requires human intervention to halt further damage.
+
+OpenZeppelin's `PausableUpgradeable` is the standard mechanism — well-audited, widely deployed, low complexity.
+
+### Decision
+
+All upgradeable contracts (`Treasury`, `RewardDistributor`, `BountyManager`, `PredictionEngine`, `PsychohistoryRouter`, `BuybackExecutor`) inherit `PausableUpgradeable`.
+
+- `DEFAULT_ADMIN_ROLE` may call `pause()` and `unpause()` (no separate `PAUSER_ROLE` for V0.3 — this can be added in V0.4 if multisig governance refines roles)
+- All **user-facing state-changing functions** are gated by `whenNotPaused`:
+  - `BountyManager.createBounty`, `addSponsorship`, `cancelBounty`
+  - `PredictionEngine.submitPrediction`, `submitCutoffHint`, `settle`
+  - `BuybackExecutor.executeEpoch`
+- **Exit-path functions** are NOT gated — users can always withdraw what they're owed:
+  - `PredictionEngine.claim` (claim USDC payout + PSYH from settled bounty)
+  - `BountyManager.claimSponsorshipRefund` (sponsor refund on Invalidated / Cancelled / NoSignal)
+  - `RewardDistributor.claimTokens` (claim PSYH after settlement)
+  - `Treasury.daoWithdraw` (DEFAULT_ADMIN_ROLE; emergency withdrawal possible)
+
+### Rationale
+
+- **Standard pattern**: deviation from norm would itself raise audit concerns
+- **Halt new activity, allow exit**: best practice for emergency response — users can rescue funds while admin investigates
+- **Single role for V0.3**: governance complexity is a future problem (V0.4 may split out PAUSER_ROLE for multisig delegation)
+
+### Consequences
+
+**Positive**:
+- Vulnerability response capability without contract upgrade
+- Users retain claim/refund paths during pause
+- Standard pattern, easily audited
+
+**Negative**:
+- DEFAULT_ADMIN_ROLE has unilateral pause power. **Centralization risk acknowledged** — passion launch operates under single-multisig trust.
+- Pause is a censorship surface (admin could pause to delay specific predictors) — mitigation: log all pause/unpause events for community visibility, ADR-0013 time-lock applies to admin withdrawal during pause.
+
+**Follow-up**:
+- All upgradeable contracts inherit `PausableUpgradeable`
+- §10 each interface has corresponding `Paused` / `Unpaused` events documented
+- Specific function-level `whenNotPaused` per the list above
+- L2-T3 / T4 / T5 implementations include pause test (paused contract rejects target functions, exit-paths still work)
+
+---
+
+## ADR-0013 — Launch-period withdrawal time-lock (Treasury)
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (Q4 audit compensating controls); L1 ratification in this commit
+**Related**: ADR-0011 (TVL cap), ADR-0012 (pause switch); TDD V0.31 §10.4 (Treasury), §13 (deployment)
+
+### Context
+
+Final compensating control for the AI-only audit decision. Even with TVL cap and pause switch, a compromised admin key (one of multisig signers) could rapidly drain Treasury of accumulated DAO sub-account / FEE / BUYBACK balances.
+
+Time-lock pattern: admin actions are *scheduled*, not *executed* immediately. A delay (7 days) gives community / oracle / observers time to detect and trigger emergency pause (ADR-0012) before the action takes effect.
+
+### Decision
+
+Treasury admin-only outflow functions (`daoWithdraw`, `pullBuybackForEpoch` if admin-callable) are gated by a 7-day time-lock during the launch period.
+
+- `Treasury.scheduleDaoWithdrawal(address to, uint256 amount, bytes32 category, string reason) returns (bytes32 withdrawalId)`: schedules a withdrawal, executable after 7 days
+- `Treasury.executeDaoWithdrawal(bytes32 withdrawalId)`: callable by anyone after the 7-day delay; transfers funds
+- `Treasury.cancelDaoWithdrawal(bytes32 withdrawalId)`: callable by `DEFAULT_ADMIN_ROLE` (or governance vote in V0.4); cancels pending withdrawal
+
+Sunset: A flag `launchPeriodActive` defaults `true`. After ≥ 6 months from deployment, `DEFAULT_ADMIN_ROLE` may call `endLaunchPeriod()` (one-way; cannot be re-enabled). After end-launch:
+
+- New `daoWithdraw` calls execute immediately (no time-lock)
+- Pending scheduled withdrawals remain time-locked
+
+`pullBuybackForEpoch` is not time-locked (it's automated and bounded by `1/12 × balance` per epoch — limited blast radius).
+
+### Rationale
+
+- **Compromised admin key buys 7 days** before exfiltration completes — community has detection window
+- **Sunset prevents permanent operational friction**: 6 months of stable operation = trust earned, time-lock removed for ergonomics
+- **Limited scope**: only admin outflows time-locked, not buyback automation or user claims
+
+### Consequences
+
+**Positive**:
+- Admin-key-compromise loss bounded (7-day delay → emergency pause + key rotation possible)
+- Bounded by sunset (not eternal friction)
+- Compatible with future governance: V0.4 DAO can replace admin role with governance vote
+
+**Negative**:
+- Operational friction during launch: legitimate admin withdrawals delayed 7 days
+- "launchPeriodActive" sunset is a one-way flag; if admin lost, sunset can't be triggered without governance migration
+- Sponsor analytics service operations may need pre-funding to avoid mid-stream withdrawal delays
+
+**Follow-up**:
+- §9 / §10.4 Treasury add `pendingWithdrawals` mapping, schedule/execute/cancel functions
+- §10.4 add `launchPeriodActive` flag + `endLaunchPeriod()` admin function
+- §13 deployment script initializes `launchPeriodActive = true`
+- L2-T3.1 implementation includes time-lock tests
+
+---
+
+## ADR-0014 — Qualified Proposition Standard (QPS)
+
+**Status**: Accepted
+**Date**: 2026-05-09
+**Decided by**: L1 CEO review (Hook #4-C → owner-as-oracle subjective resolution risk dissolved by proposition design rigor); L1 ratification in this commit
+**Related**: ADR-0007 (cutoff hint replaceability — also a Schelling-point oracle move); TDD V0.31 §3 (proposition types) — *no spec change*; new doc `docs/PROPOSITION_STANDARD.md`
+
+### Context
+
+The L1 CEO review Hook #4-C surfaced a concern about owner participating in predictions while also serving as oracle — a potential conflict where owner could "interpret" categorical / subjective proposition outcomes to favor their own positions.
+
+The user's response reframed this from a mechanism problem to a **proposition design** problem:
+
+> "理论上可以调整解读、让自己赢——这是我们的预测事件上面的严谨性要求啊。预测事件一个合格的预测事件应该要求就是没有调整解读的空间。"
+
+This insight is structurally important. If the protocol's proposition curation (curator review for V0.3, sponsor self-service for V0.4) enforces a quality bar where every proposition has **zero interpretation latitude**, then:
+
+- Owner-as-oracle has nothing to interpret — they can only read the published source
+- No need for mechanism-layer restrictions on owner participation
+- Future oracle decentralization is much simpler (any anonymous actor can verify resolution against the named source)
+- Proposition design itself becomes the security control, not contract-level multi-sig oracle
+
+This is essentially a **Schelling-point oracle** philosophy applied to proposition design.
+
+### Decision
+
+Establish the **Qualified Proposition Standard (QPS)** as a project-level proposition curation principle:
+
+Every Psychohistory proposition (whether team-curated, sponsor-curated, or self-service) must satisfy 5 conditions:
+
+1. **Single authoritative public source**: resolution comes from one publicly accessible data source (NASDAQ, China NBS, Lloyd's List Intelligence, OpenAI official Twitter, etc.)
+2. **Source explicitly named in proposition metadata**: the source URL/identifier is stored in `Bounty.metadataURI` JSON, not informally referenced
+3. **Numerical / categorical value unambiguous**: "GDP growth rate" not "economy good/bad"; "weekly transit count" not "is Hormuz blockaded"
+4. **Resolution timing unambiguous**: specific date + "first published" / "as-of-X" / "Q-X release"
+5. **Failure clause prebuilt**: if source unavailable / publishes differently than expected by `resolutionDeadline`, the proposition resolves as `Invalidated` (refund path)
+
+Detailed standard with examples, anti-examples, edge cases, and curator review checklist is documented in `docs/PROPOSITION_STANDARD.md`.
+
+### Rationale
+
+- **Eliminates owner-as-oracle subjectivity attack surface** at the proposition layer rather than the mechanism layer (see Hook #4-C resolution)
+- **Aligns with Schelling-point oracle paradigm** — any honest observer reaches identical resolution
+- **Reduces oracle trust load** — paving way for decentralized oracle in V0.4+
+- **Provides curator review checklist** — sponsor-self-service proposition (V0.4 candidate) gets a quality gate
+- **Clean E-class proposition design**: previously deferred E-type "categorical scenarios" (Hormuz blockade, etc.) becomes feasible at launch by reframing to objective measures (transit count buckets, etc.)
+
+### Consequences
+
+**Positive**:
+- Owner participation in own bounties no longer requires mechanism limit (S7 in L1 strategic decisions)
+- E-class propositions feasible at launch (S4 amended)
+- Future oracle decentralization simplified
+- Curation quality bar explicit
+
+**Negative**:
+- Some real-world questions cannot be qualified (e.g., "did war start" without a specific source) — these are deliberately out of scope
+- Curator workload during V0.3 launch (team is curator, must enforce standard manually)
+
+**Follow-up**:
+- New file `docs/PROPOSITION_STANDARD.md` with full standard + examples
+- TDD V0.32 §3 references QPS for proposition design discipline (no spec change)
+- L2-T3.3 (BountyManager) implementation: `metadataURI` JSON schema must accommodate QPS source/timing/failure fields (off-chain schema, no contract enforcement)
+- Future V0.4: front-end / curator review tool enforces QPS at proposition creation flow
+
+---
+
 ## Future ADRs
 
-The next ADR slot is **ADR-0008**. Candidates that may need ADRs in the future:
+The next ADR slot is **ADR-0015**. Candidates that may need ADRs in the future:
 
 - DEX venue choice (Uniswap V3 vs CoW Protocol vs both) — to be decided in L2-T5b
 - Cutoff hint griefing mitigation (refundable bond) — V0.4 candidate; depends on V0.3 production observations
@@ -409,3 +831,7 @@ The next ADR slot is **ADR-0008**. Candidates that may need ADRs in the future:
 - Oracle decentralization path — Phase 4 scope per TDD §7.4
 - Front-end privy / authentication choice — out of scope of TDD per §16
 - KYC for high-value sponsors — out of scope of TDD per §16
+- Multi-winner Discrete proposition support (K-of-N selection) — V0.4 candidate per `docs/TODOS.md`
+- A2-oracle-encrypted privacy mode (V0.4 candidate per ADR-0001 hooks; demand-driven by画像 A sponsor presence)
+- A* threshold-encryption privacy mode (longer-term per ADR-0001)
+- Jurisdiction strategy formalization (currently per `docs/TODOS.md` triggers; full ADR pending entity registration)
